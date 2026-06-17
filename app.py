@@ -51,6 +51,20 @@ st.markdown("""
 CHANNELS = ["Email", "Social", "CPC", "Affiliate"]
 STATUSES = ["Active", "Paused", "Completed"]
 
+# Postgres NUMERIC/DECIMAL columns that psycopg2 returns as decimal.Decimal.
+# Casting them to float64 at the DB boundary prevents
+# "unsupported operand type(s) for +: 'decimal.Decimal' and 'float'" errors
+# that otherwise surface in pandas .sum() / numpy reductions.
+DECIMAL_COLS = ["budget", "actual_spend"]
+
+# ─── Version-safe fragment helper ────────────────────────────────────────────
+def _smart_fragment(func):
+    if hasattr(st, "fragment"):
+        return st.fragment(func)
+    if hasattr(st, "experimental_fragment"):
+        return st.experimental_fragment(func)
+    return func
+
 # ─── DB Connection ───────────────────────────────────────────────────────────
 # secrets.toml format:
 # [postgres]
@@ -70,6 +84,23 @@ def get_connection():
         password = st.secrets["postgres"]["password"],
     )
 
+# ─── Decimal coercion ────────────────────────────────────────────────────────
+def _coerce_decimals(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cast any decimal.Decimal columns returned by psycopg2 to float64.
+
+    psycopg2 maps Postgres NUMERIC/DECIMAL to Python's decimal.Decimal for
+    precision, but pandas/numpy expect homogeneous numeric types and raise
+    "unsupported operand type(s) for +: 'decimal.Decimal' and 'float'" when
+    they encounter a mixed column during .sum() or similar reductions.
+    Calling this right after every DB read (and after concat) keeps every
+    numeric column consistently typed throughout the app.
+    """
+    for col in DECIMAL_COLS:
+        if col in df.columns:
+            df[col] = df[col].astype(float)
+    return df
+
 # ─── DB Functions ────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def load_campaigns_from_db() -> pd.DataFrame:
@@ -79,11 +110,13 @@ def load_campaigns_from_db() -> pd.DataFrame:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM campaigns ORDER BY created_date DESC, campaign_id DESC")
             rows = cur.fetchall()
-        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
+        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
             "campaign_id", "campaign_name", "channel", "status",
             "budget", "actual_spend", "start_date", "end_date",
             "created_date", "modified_date", "created_by", "modified_by",
         ])
+        # Fix: coerce Decimal → float64 immediately after loading from DB
+        return _coerce_decimals(df)
     finally:
         conn.close()
 
@@ -146,6 +179,12 @@ if "campaign_data" not in st.session_state:
     except Exception as e:
         st.session_state.campaign_data = pd.DataFrame()
         st.session_state.db_error = str(e)
+
+# Persisted filter state for the registry section below. Initialised once
+# so values survive full-page reruns (e.g. after creating a new campaign).
+st.session_state.setdefault("search_term", "")
+st.session_state.setdefault("channel_filter", "All")
+st.session_state.setdefault("status_filter", "All")
 
 # ─── Header ─────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -243,7 +282,7 @@ if submitted:
             "campaign_name": campaign_name.strip(),
             "channel":       channel,
             "status":        "Active",
-            "budget":        budget,
+            "budget":        float(budget),   # ensure float, not Decimal
             "actual_spend":  0.00,
             "start_date":    start_date,
             "end_date":      end_date,
@@ -256,8 +295,10 @@ if submitted:
             new_id = insert_campaign(record)
             record["campaign_id"] = new_id
             new_row = pd.DataFrame([record])
-            st.session_state.campaign_data = pd.concat(
-                [st.session_state.campaign_data, new_row], ignore_index=True
+            # Fix: coerce after concat so the combined DataFrame stays float64,
+            # not object-dtype (which happens when Decimal rows were present).
+            st.session_state.campaign_data = _coerce_decimals(
+                pd.concat([st.session_state.campaign_data, new_row], ignore_index=True)
             )
             load_campaigns_from_db.clear()   # bust cache
             st.success(f"✅ Campaign **{campaign_name.strip()}** created successfully!")
@@ -276,79 +317,105 @@ if df.empty:
         Use the form above to create your first campaign.
     </div>""", unsafe_allow_html=True)
 else:
-    # Filter bar
-    f1, f2, f3 = st.columns([2, 1, 1])
-    with f1:
-        search_term    = st.text_input("Search", placeholder="🔍 Filter by name…", label_visibility="collapsed")
-    with f2:
-        channel_filter = st.selectbox("Channel", ["All"] + CHANNELS, label_visibility="collapsed")
-    with f3:
-        status_filter  = st.selectbox("Status",  ["All"] + STATUSES, label_visibility="collapsed")
+    @_smart_fragment
+    def render_campaign_registry():
+        data = st.session_state.campaign_data
 
-    display_df = st.session_state.campaign_data.copy()
-    if search_term:
-        display_df = display_df[display_df["campaign_name"].str.contains(search_term, case=False, na=False)]
-    if channel_filter != "All":
-        display_df = display_df[display_df["channel"] == channel_filter]
-    if status_filter != "All":
-        display_df = display_df[display_df["status"] == status_filter]
+        with st.form("search_form", clear_on_submit=False):
+            sf1, sf2 = st.columns([4, 1])
+            with sf1:
+                st.text_input(
+                    "Search", placeholder="🔍 Filter by name…",
+                    label_visibility="collapsed", key="search_term",
+                )
+            with sf2:
+                st.form_submit_button("Apply", use_container_width=True)
 
-    st.caption(f"Showing {len(display_df)} of {len(st.session_state.campaign_data)} campaigns")
+        f2, f3 = st.columns(2)
+        with f2:
+            channel_filter = st.selectbox(
+                "Channel", ["All"] + CHANNELS,
+                index=(["All"] + CHANNELS).index(st.session_state.channel_filter),
+                label_visibility="collapsed", key="channel_filter",
+            )
+        with f3:
+            status_filter = st.selectbox(
+                "Status", ["All"] + STATUSES,
+                index=(["All"] + STATUSES).index(st.session_state.status_filter),
+                label_visibility="collapsed", key="status_filter",
+            )
 
-    edited_df = st.data_editor(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        column_config={
-            "campaign_id":   st.column_config.NumberColumn("ID",              disabled=True, width="small"),
-            "campaign_name": st.column_config.TextColumn("Campaign Name",     disabled=True, width="large"),
-            "channel":       st.column_config.TextColumn("Channel",           disabled=True, width="small"),
-            "status":        st.column_config.SelectboxColumn("Status",       options=STATUSES, width="small"),
-            "budget":        st.column_config.NumberColumn("Budget ($)",      format="$%.2f", min_value=0.01, width="medium"),
-            "actual_spend":  st.column_config.NumberColumn("Actual Spend ($)",format="$%.2f", disabled=True, width="medium"),
-            "start_date":    st.column_config.DateColumn("Start",             disabled=True, width="small"),
-            "end_date":      st.column_config.DateColumn("End",               disabled=True, width="small"),
-            "created_date":  st.column_config.DateColumn("Created",           disabled=True, width="small"),
-            "modified_date": st.column_config.DateColumn("Modified",          disabled=True, width="small"),
-            "created_by":    st.column_config.TextColumn("Created By",        disabled=True, width="small"),
-            "modified_by":   st.column_config.TextColumn("Modified By",       disabled=True, width="small"),
-        },
-        key="registry_editor",
-    )
+        search_term = st.session_state.search_term
 
-    # SRS §3.2: explicit Save Changes button
-    if st.button("💾 Save Changes", type="primary"):
-        master = st.session_state.campaign_data.copy()
-        today  = date.today()
-        changed_rows = []
+        display_df = data.copy()
+        if search_term:
+            display_df = display_df[display_df["campaign_name"].str.contains(search_term, case=False, na=False)]
+        if channel_filter != "All":
+            display_df = display_df[display_df["channel"] == channel_filter]
+        if status_filter != "All":
+            display_df = display_df[display_df["status"] == status_filter]
 
-        for _, edited_row in edited_df.iterrows():
-            cid  = edited_row["campaign_id"]
-            orig = master.loc[master["campaign_id"] == cid].iloc[0]
-            if orig["budget"] != edited_row["budget"] or orig["status"] != edited_row["status"]:
-                changed_rows.append({
-                    "campaign_id":  cid,
-                    "budget":       edited_row["budget"],
-                    "status":       edited_row["status"],
-                    "modified_date": today,
-                    "modified_by":  "current_user",
-                })
-                master.loc[master["campaign_id"] == cid, "budget"]        = edited_row["budget"]
-                master.loc[master["campaign_id"] == cid, "status"]        = edited_row["status"]
-                master.loc[master["campaign_id"] == cid, "modified_date"] = today
-                master.loc[master["campaign_id"] == cid, "modified_by"]   = "current_user"
+        st.caption(f"Showing {len(display_df)} of {len(data)} campaigns")
 
-        if not changed_rows:
-            st.info("No changes detected.")
-        else:
-            try:
-                save_edits_to_db(changed_rows)
-                st.session_state.campaign_data = master
-                load_campaigns_from_db.clear()
-                st.success(f"Saved {len(changed_rows)} change(s) successfully.")
-            except Exception as e:
-                st.error(f"Failed to save changes: {e}")
+        editor_key = f"registry_editor_{channel_filter}_{status_filter}_{search_term}"
+
+        edited_df = st.data_editor(
+            display_df,
+            use_container_width=False,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "campaign_id":   st.column_config.NumberColumn("ID",              disabled=True, width="small"),
+                "campaign_name": st.column_config.TextColumn("Campaign Name",     disabled=True, width="large"),
+                "channel":       st.column_config.TextColumn("Channel",           disabled=True, width="small"),
+                "status":        st.column_config.SelectboxColumn("Status",       options=STATUSES, width="small"),
+                "budget":        st.column_config.NumberColumn("Budget ($)",      format="$%.2f", min_value=0.01, width="medium"),
+                "actual_spend":  st.column_config.NumberColumn("Actual Spend ($)",format="$%.2f", disabled=True, width="medium"),
+                "start_date":    st.column_config.DateColumn("Start",             disabled=True, width="small"),
+                "end_date":      st.column_config.DateColumn("End",               disabled=True, width="small"),
+                "created_date":  st.column_config.DateColumn("Created",           disabled=True, width="small"),
+                "modified_date": st.column_config.DateColumn("Modified",          disabled=True, width="small"),
+                "created_by":    st.column_config.TextColumn("Created By",        disabled=True, width="small"),
+                "modified_by":   st.column_config.TextColumn("Modified By",       disabled=True, width="small"),
+            },
+            key=editor_key,
+        )
+
+        # SRS §3.2: explicit Save Changes button
+        if st.button("💾 Save Changes", type="primary"):
+            master = data.copy()
+            today  = date.today()
+            changed_rows = []
+
+            for _, edited_row in edited_df.iterrows():
+                cid  = edited_row["campaign_id"]
+                orig = master.loc[master["campaign_id"] == cid].iloc[0]
+                if orig["budget"] != edited_row["budget"] or orig["status"] != edited_row["status"]:
+                    changed_rows.append({
+                        "campaign_id":   cid,
+                        "budget":        float(edited_row["budget"]),  # ensure float
+                        "status":        edited_row["status"],
+                        "modified_date": today,
+                        "modified_by":   "current_user",
+                    })
+                    master.loc[master["campaign_id"] == cid, "budget"]        = float(edited_row["budget"])
+                    master.loc[master["campaign_id"] == cid, "status"]        = edited_row["status"]
+                    master.loc[master["campaign_id"] == cid, "modified_date"] = today
+                    master.loc[master["campaign_id"] == cid, "modified_by"]   = "current_user"
+
+            if not changed_rows:
+                st.info("No changes detected.")
+            else:
+                try:
+                    save_edits_to_db(changed_rows)
+                    st.session_state.campaign_data = master
+                    load_campaigns_from_db.clear()
+                    st.success(f"Saved {len(changed_rows)} change(s) successfully.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to save changes: {e}")
+
+    render_campaign_registry()
 
     # ─── Analytics (only shown when there's data) ────────────────────────────
     st.markdown('<div class="section-title">Budget vs. Spend by Channel</div>', unsafe_allow_html=True)
